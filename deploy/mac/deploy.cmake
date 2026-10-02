@@ -13,9 +13,16 @@ if (OSX_BUNDLE)
   if (APPLE_CODESIGN_DEV)
     set(_codesign_identity "${APPLE_CODESIGN_DEV}")
   endif()
+  # macdeployqt only rewrites the bundle's main executable, so deskflow-core --
+  # a second binary in Contents/MacOS -- keeps the Qt paths of the build machine
+  # (e.g. /opt/homebrew/opt/qtbase/lib/QtCore.framework/...).  the frameworks get
+  # bundled correctly either way, so on another mac the gui launches and then the
+  # core process fails to load its libraries.  -executable= makes macdeployqt
+  # rewrite that binary's load commands too.
   install(CODE "execute_process(COMMAND
     ${DEPLOYQT}
     \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_PROPER_NAME}.app\"
+    \"-executable=\${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_PROPER_NAME}.app/Contents/MacOS/${CMAKE_PROJECT_NAME}-core\"
     -hardened-runtime -timestamp \"-codesign=${_codesign_identity}\"
   )")
   set(CPACK_PACKAGE_ICON "${MY_DIR}/dmg-volume.icns")
