@@ -11,6 +11,9 @@
 #include "deskflow/IClipboard.h"
 
 #include <Carbon/Carbon.h>
+#include <atomic>
+#include <cstdint>
+#include <memory>
 #include <vector>
 
 class IOSXClipboardConverter;
@@ -39,8 +42,16 @@ public:
   //! Test if the clipboard came from another device via Universal Clipboard
   bool isRemote() const;
 
+  //! Test if a read that timed out has since completed
+  /*!
+  Returns true, once, when the data for a read that get() gave up on has
+  arrived, so the clipboard is worth reading again.
+  */
+  bool takeLateFetch();
+
 private:
   void clearConverters();
+  bool fetch(PasteboardItemID item, CFStringRef type, std::string &data) const;
 
 private:
   using ConverterList = std::vector<IOSXClipboardConverter *>;
@@ -48,6 +59,16 @@ private:
   mutable Time m_time;
   ConverterList m_converters;
   PasteboardRef m_pboard;
+
+  // bumped every time the pasteboard contents change
+  mutable uint64_t m_generation = 1;
+  // generation whose read timed out, 0 if none; reads are skipped while it's current
+  mutable uint64_t m_abandonedGeneration = 0;
+  // true once the current generation has been re-read after a late fetch
+  mutable bool m_retried = false;
+  // generation of a timed out read that has since completed, 0 if none.
+  // shared with the fetch threads, which can outlive this object.
+  std::shared_ptr<std::atomic<uint64_t>> m_lateGeneration = std::make_shared<std::atomic<uint64_t>>(0);
 };
 
 //! Clipboard format converter interface

@@ -16,6 +16,7 @@ private Q_SLOTS:
   void singleFormat();
   void formatConvert_UTF8();
   void remoteMarker();
+  void slowPromise();
 
 private:
   Log m_log;
