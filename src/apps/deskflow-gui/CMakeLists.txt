@@ -45,9 +45,17 @@ target_link_libraries(
   ${target}
   gui
   common
+  # Qt6::Svg is not called directly. It is linked so that it becomes a direct
+  # dependency of this executable, which is the only way macdeployqt will copy
+  # it into the bundle: macdeployqt deploys the dependencies of executables, not
+  # of plugins, and the thing that actually needs QtSvg is the svg icon engine
+  # plugin (PlugIns/iconengines/libqsvgicon.dylib). Without this the plugin ships
+  # with an unresolvable @rpath/QtSvg reference, fails to load, QIcon::fromTheme
+  # has no svg renderer, and every themed icon renders blank.
   Qt6::Core
   Qt6::Widgets
-  Qt6::Network)
+  Qt6::Network
+  Qt6::Svg)
 
 install(
   TARGETS ${target}
