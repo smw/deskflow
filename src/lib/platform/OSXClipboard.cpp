@@ -15,6 +15,35 @@
 #include "platform/OSXClipboardUTF16Converter.h"
 #include "platform/OSXClipboardUTF8Converter.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <system_error>
+#include <thread>
+
+namespace {
+
+// how long a read may hold up the event thread. reading a flavor whose data
+// isn't on the pasteboard yet blocks until the sender provides it, and for a
+// Universal Clipboard item the sender is another Mac, which can take longer
+// than the keep alive timeout. this must stay under kKeepAliveRate.
+const auto kFetchTimeout = std::chrono::seconds(2);
+
+// flavor present on items that came from another device via Universal Clipboard
+const CFStringRef kRemoteClipboardFlavor = CFSTR("com.apple.is-remote-clipboard");
+
+struct FetchState
+{
+  std::mutex m_mutex;
+  std::condition_variable m_cond;
+  bool m_done = false;
+  bool m_abandoned = false;
+  OSStatus m_err = noErr;
+  std::string m_data;
+};
+
+} // namespace
+
 //
 // OSXClipboard
 //
@@ -70,9 +99,35 @@ bool OSXClipboard::synchronize()
   LOG_VERBOSE("flags: %x", flags);
 
   if (flags & kPasteboardModified) {
+    ++m_generation;
+    m_retried = false;
     return true;
   }
   return false;
+}
+
+bool OSXClipboard::isRemote() const
+{
+  if (m_pboard == nullptr)
+    return false;
+
+  PasteboardItemID item;
+  PasteboardFlavorFlags flags;
+  return PasteboardGetItemIdentifier(m_pboard, (CFIndex)1, &item) == noErr &&
+         PasteboardGetItemFlavorFlags(m_pboard, item, kRemoteClipboardFlavor, &flags) == noErr;
+}
+
+bool OSXClipboard::takeLateFetch()
+{
+  const uint64_t generation = m_lateGeneration->exchange(0);
+  if (generation == 0 || generation != m_generation || generation != m_abandonedGeneration || m_retried) {
+    return false;
+  }
+
+  LOG_DEBUG("clipboard data arrived after read timed out");
+  m_abandonedGeneration = 0;
+  m_retried = true;
+  return true;
 }
 
 void OSXClipboard::add(Format format, const std::string &data)
@@ -136,6 +191,10 @@ bool OSXClipboard::has(Format format) const
   if (m_pboard == nullptr)
     return false;
 
+  // a read of this clipboard timed out, don't try the other formats
+  if (m_abandonedGeneration == m_generation)
+    return false;
+
   PasteboardItemID item;
   PasteboardGetItemIdentifier(m_pboard, (CFIndex)1, &item);
 
@@ -165,6 +224,9 @@ std::string OSXClipboard::get(Format format) const
   if (m_pboard == nullptr)
     return result;
 
+  if (m_abandonedGeneration == m_generation)
+    return result;
+
   PasteboardGetItemIdentifier(m_pboard, (CFIndex)1, &item);
 
   // find the converter for the first clipboard format we can handle
@@ -188,26 +250,75 @@ std::string OSXClipboard::get(Format format) const
   }
 
   // get the clipboard data.
-  CFDataRef buffer = nullptr;
-  try {
-    OSStatus err = PasteboardCopyItemFlavorData(m_pboard, item, type, &buffer);
-
-    if (err != noErr) {
-      throw err;
-    }
-
-    result = std::string((char *)CFDataGetBytePtr(buffer), CFDataGetLength(buffer));
-  } catch (OSStatus err) {
-    LOG_DEBUG("exception thrown in OSXClipboard::get MacError (%d)", err);
-  } catch (...) {
-    LOG_DEBUG("unknown exception in OSXClipboard::get");
-    RETHROW_THREADEXCEPTION
+  if (!fetch(item, type, result)) {
+    return std::string();
   }
 
-  if (buffer != nullptr)
-    CFRelease(buffer);
-
   return converter->toIClipboard(result);
+}
+
+bool OSXClipboard::fetch(PasteboardItemID item, CFStringRef type, std::string &data) const
+{
+  // read on another thread so that a slow sender can't stall the event
+  // thread. the thread uses its own pasteboard reference; the pasteboard
+  // functions aren't safe to call on one reference from two threads.
+  auto state = std::make_shared<FetchState>();
+  try {
+    std::thread([state, type, late = m_lateGeneration, generation = m_generation] {
+      OSStatus err;
+      std::string buffer;
+      PasteboardRef pboard = nullptr;
+      if ((err = PasteboardCreate(kPasteboardClipboard, &pboard)) == noErr) {
+        PasteboardSynchronize(pboard);
+
+        PasteboardItemID threadItem;
+        CFDataRef dataRef = nullptr;
+        if ((err = PasteboardGetItemIdentifier(pboard, (CFIndex)1, &threadItem)) == noErr &&
+            (err = PasteboardCopyItemFlavorData(pboard, threadItem, type, &dataRef)) == noErr && dataRef != nullptr) {
+          buffer.assign((const char *)CFDataGetBytePtr(dataRef), CFDataGetLength(dataRef));
+          CFRelease(dataRef);
+        }
+        CFRelease(pboard);
+      }
+
+      std::scoped_lock lock(state->m_mutex);
+      state->m_err = err;
+      state->m_data = std::move(buffer);
+      state->m_done = true;
+      if (state->m_abandoned) {
+        late->store(generation);
+      }
+      state->m_cond.notify_one();
+    }).detach();
+  } catch (const std::system_error &e) {
+    LOG_WARN("failed to start clipboard read: %s", e.what());
+    return false;
+  }
+
+  std::unique_lock lock(state->m_mutex);
+  if (!state->m_cond.wait_for(lock, kFetchTimeout, [&state] { return state->m_done; })) {
+    state->m_abandoned = true;
+    lock.unlock();
+    m_abandonedGeneration = m_generation;
+
+    PasteboardFlavorFlags flags = 0;
+    PasteboardGetItemFlavorFlags(m_pboard, item, type, &flags);
+    const bool remote = isRemote();
+    LOG_WARN(
+        "clipboard read timed out after %d seconds%s%s, %s", static_cast<int>(kFetchTimeout.count()),
+        remote ? " (universal clipboard item)" : "", (flags & kPasteboardFlavorPromised) ? " (promised data)" : "",
+        m_retried ? "giving up on this clipboard" : "will retry when the data arrives"
+    );
+    return false;
+  }
+
+  if (state->m_err != noErr) {
+    LOG_DEBUG("failed to read clipboard data: error %d", state->m_err);
+    return false;
+  }
+
+  data = std::move(state->m_data);
+  return true;
 }
 
 void OSXClipboard::clearConverters()
