@@ -15,6 +15,13 @@
 #include "platform/OSXClipboardUTF16Converter.h"
 #include "platform/OSXClipboardUTF8Converter.h"
 
+namespace {
+
+// flavor present on items that came from another device via Universal Clipboard
+const CFStringRef kRemoteClipboardFlavor = CFSTR("com.apple.is-remote-clipboard");
+
+} // namespace
+
 //
 // OSXClipboard
 //
@@ -73,6 +80,17 @@ bool OSXClipboard::synchronize()
     return true;
   }
   return false;
+}
+
+bool OSXClipboard::isRemote() const
+{
+  if (m_pboard == nullptr)
+    return false;
+
+  PasteboardItemID item;
+  PasteboardFlavorFlags flags;
+  return PasteboardGetItemIdentifier(m_pboard, (CFIndex)1, &item) == noErr &&
+         PasteboardGetItemFlavorFlags(m_pboard, item, kRemoteClipboardFlavor, &flags) == noErr;
 }
 
 void OSXClipboard::add(Format format, const std::string &data)

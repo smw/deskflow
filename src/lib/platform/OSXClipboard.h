@@ -36,6 +36,9 @@ public:
 
   bool synchronize();
 
+  //! Test if the clipboard came from another device via Universal Clipboard
+  bool isRemote() const;
+
 private:
   void clearConverters();
 

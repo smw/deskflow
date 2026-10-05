@@ -39,4 +39,30 @@ void OSXClipboardTests::formatConvert_UTF8()
   QCOMPARE(converter.toIClipboard("test data\r"), "test data\n");
 }
 
+void OSXClipboardTests::remoteMarker()
+{
+  using enum IClipboard::Format;
+
+  OSXClipboard clipboard;
+  QVERIFY(clipboard.empty());
+  clipboard.add(Text, m_testString);
+  QVERIFY(!clipboard.isRemote());
+
+  // replace it with an item marked the way universal clipboard does
+  PasteboardRef pboard = nullptr;
+  QCOMPARE(PasteboardCreate(kPasteboardClipboard, &pboard), noErr);
+  QCOMPARE(PasteboardClear(pboard), noErr);
+  PasteboardSynchronize(pboard);
+  const uint8_t marker = 1;
+  CFDataRef data = CFDataCreate(kCFAllocatorDefault, &marker, sizeof(marker));
+  for (CFStringRef type : {CFSTR("public.utf8-plain-text"), CFSTR("com.apple.is-remote-clipboard")}) {
+    QCOMPARE(PasteboardPutItemFlavor(pboard, (PasteboardItemID)1, type, data, kPasteboardFlavorNoFlags), noErr);
+  }
+  CFRelease(data);
+  CFRelease(pboard);
+
+  clipboard.synchronize();
+  QVERIFY(clipboard.isRemote());
+}
+
 QTEST_MAIN(OSXClipboardTests)

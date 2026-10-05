@@ -847,7 +847,17 @@ bool OSXComputer::setClipboard(ClipboardID, const IClipboard *src)
 void OSXComputer::checkClipboards()
 {
   LOG_VERBOSE("checking clipboard");
-  if (m_pasteboard.synchronize()) {
+  const bool changed = m_pasteboard.synchronize();
+
+  // universal clipboard items are copies of what was copied on another
+  // device. reading one blocks while it is fetched from that device, and if
+  // that device is also sharing its clipboard then it sends the original.
+  if (changed && m_pasteboard.isRemote()) {
+    LOG_INFO("ignoring clipboard from another device (universal clipboard)");
+    return;
+  }
+
+  if (changed) {
     LOG_DEBUG("clipboard changed");
     sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardClipboard);
     sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardSelection);
